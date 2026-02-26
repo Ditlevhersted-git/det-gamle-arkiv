@@ -15,6 +15,25 @@ THUMBS_DIR = Path("data/thumbs")
 
 app = Flask(__name__)
 
+# ---------- samlinger + underkategorier (labels) ----------
+
+COLLECTIONS = {
+    "Dansk Skolesløjd – Modeltegninger": [str(y) for y in range(1942, 1951)],
+    "Dansk Sløjdlærerforening – Modeltegninger (Aksel Mikkelsen)": ["1908", "1910"],
+    "Dansk Skolesløjd – Modeltegninger (Dansk Sløjdlærerforening)": [
+        "1923",
+        "1928",
+        "1934",
+        "1935 (Jubilæumskrift)",
+        "1956",
+        "1960",
+    ],
+    "Tegninger til Metalsløjd": ["1969"],
+    "Tegninger til Træsløjd": ["1968"],
+}
+
+SERIES = list(COLLECTIONS.keys())
+
 HTML = """
 <!doctype html>
 <html>
@@ -59,6 +78,72 @@ HTML = """
     <a href="/import" class="btn">Importér PDF</a>
   </form>
 
+  <div style="margin:14px 0 10px 0;">
+    <div style="font-weight:700; font-size:14px; margin-bottom:8px;">Samlinger</div>
+    <div style="display:flex; flex-wrap:wrap; gap:8px;">
+      {% for s in series %}
+        {% set active = (request.args.get('series') == s) %}
+        <a href="/?series={{s}}"
+           style="
+             padding:5px 10px;
+             font-size:13px;
+             border-radius:6px;
+             text-decoration:none;
+             border:1px solid #ccc;
+             {% if active %}
+               background:#555; color:white; border-color:#555;
+             {% else %}
+               background:#f5f5f5; color:#111;
+             {% endif %}
+           ">
+          {{s}}
+        </a>
+      {% endfor %}
+    </div>
+  </div>
+
+  {% if request.args.get('series') and suboptions %}
+    <div style="margin:6px 0 22px 0;">
+      <div style="display:flex; flex-wrap:wrap; gap:8px;">
+        {% set sub_active = (request.args.get('sub') or '') %}
+        <a href="/?series={{request.args.get('series')}}"
+           style="
+             padding:4px 9px;
+             font-size:12px;
+             border-radius:999px;
+             text-decoration:none;
+             border:1px solid #ccc;
+             {% if not sub_active %}
+               background:#555; color:white; border-color:#555;
+             {% else %}
+               background:#f5f5f5; color:#111;
+             {% endif %}
+           ">Alle</a>
+
+        {% for sub in suboptions %}
+          {% set active_sub = (sub_active == sub) %}
+          <a href="/?series={{request.args.get('series')}}&sub={{sub}}"
+             style="
+               padding:4px 9px;
+               font-size:12px;
+               border-radius:999px;
+               text-decoration:none;
+               border:1px solid #ccc;
+               {% if active_sub %}
+                 background:#555; color:white; border-color:#555;
+               {% else %}
+                 background:#f5f5f5; color:#111;
+               {% endif %}
+             ">
+            {{sub}}
+          </a>
+        {% endfor %}
+      </div>
+    </div>
+  {% else %}
+    <div style="margin:6px 0 22px 0;"></div>
+  {% endif %}
+
   {% if note %}<div class="muted">{{note}}</div>{% endif %}
 
   {% for h in hits %}
@@ -72,6 +157,13 @@ HTML = """
           {% if h.get('nr') %} — {{h['nr']}}{% endif %}
           {% if h.get('scale') %} {{h['scale']}}{% endif %}
         </div>
+
+        {% if h.get('category') %}
+          <div class="extra" style="font-weight:600;">
+            {{h['category']}}
+            {% if h.get('subcategory') %} — {{h['subcategory']}}{% endif %}
+          </div>
+        {% endif %}
 
         {% if h.get('title_extras') %}
           <div class="extra">
@@ -118,6 +210,22 @@ IMPORT_HTML = """
   <h2>Importér PDF</h2>
   <div class="box">
     <form method="post" enctype="multipart/form-data">
+
+      <div style="margin-bottom:12px;">
+        <div style="font-weight:700; margin-bottom:6px;">Kategori</div>
+        <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <select name="category_existing" style="padding:10px; font-size:16px; min-width:260px;">
+            <option value="">(Vælg eksisterende)</option>
+            {% for c in categories %}
+              <option value="{{c}}">{{c}}</option>
+            {% endfor %}
+          </select>
+          <span style="color:#666;">eller</span>
+          <input name="category_new" placeholder="Ny kategori…" style="padding:10px; font-size:16px; min-width:260px;">
+        </div>
+        <div class="muted">Tip: skriv ny kategori hvis den ikke findes i listen.</div>
+      </div>
+
       <div>
         <input type="file" name="pdf" accept="application/pdf" required>
       </div>
@@ -141,6 +249,22 @@ def connect_db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
+
+def list_categories(con):
+    rows = con.execute("""
+        SELECT DISTINCT category
+        FROM documents
+        WHERE COALESCE(category,'') <> ''
+        ORDER BY category COLLATE NOCASE
+    """).fetchall()
+    return [r["category"] for r in rows]
+
+def has_column(con, table: str, col: str) -> bool:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table});").fetchall()
+        return any((r[1] == col) for r in rows)  # r[1] = name
+    except Exception:
+        return False
 
 def project_root() -> Path:
     # app/web.py -> app/ -> project root
@@ -255,11 +379,14 @@ def _make_single_page_pdf(pdf_path: str, page_no_1based: int) -> bytes:
 
 # ---------- queries ----------
 
-def left_fts_search(con, fts_q: str, limit: int = 200):
-    sql = """
+def left_fts_search(con, fts_q: str, limit: int = 200, has_subcategory: bool = False):
+    sub_sel = "d.subcategory AS subcategory," if has_subcategory else "NULL AS subcategory,"
+    sql = f"""
     SELECT
       p.id AS page_id,
       d.filename,
+      d.category,
+      {sub_sel}
       p.page_no,
       p.thumb_path,
       p.left_titles_json_v2,
@@ -276,14 +403,17 @@ def left_fts_search(con, fts_q: str, limit: int = 200):
     """
     return con.execute(sql, (fts_q, limit)).fetchall()
 
-def left_substring_search(con, q: str, limit: int = 200):
+def left_substring_search(con, q: str, limit: int = 200, has_subcategory: bool = False):
     qn = normalize(q)
     if not qn:
         return []
-    sql = """
+    sub_sel = "d.subcategory AS subcategory," if has_subcategory else "NULL AS subcategory,"
+    sql = f"""
     SELECT
       p.id AS page_id,
       d.filename,
+      d.category,
+      {sub_sel}
       p.page_no,
       p.thumb_path,
       p.left_titles_json_v2,
@@ -300,11 +430,14 @@ def left_substring_search(con, q: str, limit: int = 200):
     """
     return con.execute(sql, (qn, limit)).fetchall()
 
-def all_pages(con, limit: int = 5000):
-    return con.execute("""
+def all_pages(con, limit: int = 5000, has_subcategory: bool = False):
+    sub_sel = "d.subcategory AS subcategory," if has_subcategory else "NULL AS subcategory,"
+    return con.execute(f"""
         SELECT
           p.id AS page_id,
           d.filename,
+          d.category,
+          {sub_sel}
           p.page_no,
           p.thumb_path,
           p.left_titles_json_v2,
@@ -323,14 +456,65 @@ def all_pages(con, limit: int = 5000):
 @app.route("/")
 def index():
     q = (request.args.get("q") or "").strip()
+    series_filter = (request.args.get("series") or "").strip()
+    sub_filter = (request.args.get("sub") or "").strip()
     hits = []
     note = None
 
     con = connect_db()
+    has_subcategory = has_column(con, "documents", "subcategory")
+
+    suboptions = []
+    if series_filter and series_filter in COLLECTIONS:
+        suboptions = COLLECTIONS[series_filter]
 
     # Browse-mode: q tom -> vis alle, men sorter alfabetisk efter titel
     if not q:
-        rows = all_pages(con, limit=5000)
+        if series_filter:
+            if has_subcategory and sub_filter:
+                rows = con.execute("""
+                    SELECT
+                      p.id AS page_id,
+                      d.filename,
+                      d.category,
+                      d.subcategory AS subcategory,
+                      p.page_no,
+                      p.thumb_path,
+                      p.left_titles_json_v2,
+                      p.left_titles_json,
+                      p.left_nr_v2,
+                      p.left_nr,
+                      p.left_scale_v2,
+                      p.left_scale
+                    FROM pages p
+                    JOIN documents d ON d.id = p.document_id
+                    WHERE d.category = ?
+                      AND d.subcategory = ?
+                    LIMIT ?;
+                """, (series_filter, sub_filter, 5000)).fetchall()
+            else:
+                rows = con.execute(f"""
+                    SELECT
+                      p.id AS page_id,
+                      d.filename,
+                      d.category,
+                      {"d.subcategory AS subcategory," if has_subcategory else "NULL AS subcategory,"}
+                      p.page_no,
+                      p.thumb_path,
+                      p.left_titles_json_v2,
+                      p.left_titles_json,
+                      p.left_nr_v2,
+                      p.left_nr,
+                      p.left_scale_v2,
+                      p.left_scale
+                    FROM pages p
+                    JOIN documents d ON d.id = p.document_id
+                    WHERE d.category = ?
+                    LIMIT ?;
+                """, (series_filter, 5000)).fetchall()
+        else:
+            rows = all_pages(con, limit=5000, has_subcategory=has_subcategory)
+
         for r in rows:
             main, extras, nr, scale = _label_from_row(r)
             hits.append({
@@ -342,13 +526,22 @@ def index():
                 "title_extras": extras,
                 "nr": nr,
                 "scale": scale,
+                "category": r["category"],
+                "subcategory": r["subcategory"],
             })
         con.close()
 
         hits.sort(key=lambda h: (normalize(h["title_main"]), normalize(h["filename"]), int(h["page_no"])))
 
         note = f"Resultater: {len(hits)}"
-        return render_template_string(HTML, q=q, hits=hits, note=note)
+        return render_template_string(
+            HTML,
+            q=q,
+            hits=hits,
+            note=note,
+            series=SERIES,
+            suboptions=suboptions,
+        )
 
     # Search-mode: bevar relevans (FTS først, derefter substring)
     seen = set()
@@ -357,12 +550,16 @@ def index():
     rows = []
     if fts_q:
         try:
-            rows = left_fts_search(con, fts_q, limit=200)
+            rows = left_fts_search(con, fts_q, limit=200, has_subcategory=has_subcategory)
         except sqlite3.OperationalError:
             rows = []
 
     for r in rows:
         if r["page_id"] in seen:
+            continue
+        if series_filter and r["category"] != series_filter:
+            continue
+        if sub_filter and has_subcategory and r["subcategory"] != sub_filter:
             continue
         seen.add(r["page_id"])
         main, extras, nr, scale = _label_from_row(r)
@@ -375,12 +572,18 @@ def index():
             "title_extras": extras,
             "nr": nr,
             "scale": scale,
+            "category": r["category"],
+            "subcategory": r["subcategory"],
         })
 
     if len(hits) < 30:
-        rows2 = left_substring_search(con, q, limit=200)
+        rows2 = left_substring_search(con, q, limit=200, has_subcategory=has_subcategory)
         for r in rows2:
             if r["page_id"] in seen:
+                continue
+            if series_filter and r["category"] != series_filter:
+                continue
+            if sub_filter and has_subcategory and r["subcategory"] != sub_filter:
                 continue
             seen.add(r["page_id"])
             main, extras, nr, scale = _label_from_row(r)
@@ -393,11 +596,20 @@ def index():
                 "title_extras": extras,
                 "nr": nr,
                 "scale": scale,
+                "category": r["category"],
+                "subcategory": r["subcategory"],
             })
 
     con.close()
     note = f"Resultater: {len(hits)}" if hits else "Ingen resultater"
-    return render_template_string(HTML, q=q, hits=hits, note=note)
+    return render_template_string(
+        HTML,
+        q=q,
+        hits=hits,
+        note=note,
+        series=SERIES,
+        suboptions=suboptions,
+    )
 
 @app.route("/thumb/<path:fname>")
 def thumb(fname):
@@ -512,11 +724,18 @@ def delete_page(page_id: int):
 @app.route("/import", methods=["GET", "POST"])
 def import_pdf():
     if request.method == "GET":
-        return render_template_string(IMPORT_HTML)
+        con = connect_db()
+        cats = list_categories(con)
+        con.close()
+        return render_template_string(IMPORT_HTML, categories=cats)
 
     f = request.files.get("pdf")
     if not f or not f.filename:
         abort(400, description="Ingen fil valgt")
+
+    existing_cat = (request.form.get("category_existing") or "").strip()
+    new_cat = (request.form.get("category_new") or "").strip()
+    chosen_cat = (new_cat or existing_cat) or None
 
     orig_name = Path(f.filename).name
     orig_name = re.sub(r"[^A-Za-z0-9ÆØÅæøå _\-.]", "_", orig_name)
@@ -572,11 +791,7 @@ body{font-family:Arial,sans-serif;margin:24px;}
 <script>
 function setStatus(t){document.getElementById('status').textContent=t;}
 function setSmall(t){document.getElementById('small').textContent=t;}
-function addLog(t){
-  var el = document.getElementById('log');
-  el.style.display = 'block';
-  el.textContent += t + "\\n";
-}
+function addLog(t){document.getElementById('log').textContent += t + "\\n";}
 </script>
 """
 
@@ -602,6 +817,16 @@ function addLog(t){
                 yield "</body></html>"
                 return
 
+            # gem kategori på dokumentet (efter ingest har oprettet documents-row)
+            if chosen_cat:
+                try:
+                    con2 = connect_db()
+                    con2.execute("UPDATE documents SET category = ? WHERE id = ?", (chosen_cat, document_id))
+                    con2.commit()
+                    con2.close()
+                except sqlite3.OperationalError as e:
+                    raise RuntimeError('DB mangler kolonnen documents.category. Kør: sqlite3 app/app.db "ALTER TABLE documents ADD COLUMN category TEXT;"') from e
+
             con = connect_db()
             con.execute("""
                 UPDATE pages
@@ -614,42 +839,16 @@ function addLog(t){
 
             yield "<script>setStatus('Scanner venstre labels…');</script>\n"
             llm_cmd = [py, "scripts/llm_left_labels_v2.py", "--document-id", str(document_id)]
+            for line in run_cmd(llm_cmd):
+                m = re.match(r"^\[(\d+)/(\d+)\]\s+page_id=", line)
+                if m:
+                    i, n = m.group(1), m.group(2)
+                    yield f"<script>setStatus('Scanner venstre labels (side {i}/{n})');</script>\n"
+                    continue
 
-            # --- DEBUG ADDITION (isolated): capture full LLM output on failure ---
-            llm_out = []
-            llm_p = subprocess.Popen(
-                llm_cmd,
-                cwd=str(root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            try:
-                for line in llm_p.stdout:
-                    line = line.rstrip("\n")
-                    llm_out.append(line)
-
-                    m = re.match(r"^\[(\d+)/(\d+)\]\s+page_id=", line)
-                    if m:
-                        i, n = m.group(1), m.group(2)
-                        yield f"<script>setStatus('Scanner venstre labels (side {i}/{n})');</script>\n"
-                        continue
-
-                    if "ERROR" in line or "Traceback" in line:
-                        safe = line.replace("\\", "\\\\").replace("'", "\\'")
-                        yield f"<script>addLog('{safe}');</script>\n"
-            finally:
-                llm_p.wait()
-
-            if llm_p.returncode != 0:
-                out_text = "\n".join(llm_out) if llm_out else f"(no output) returncode={llm_p.returncode}"
-                safe = out_text.replace("\\", "\\\\").replace("'", "\\'").replace("\r", "").replace("\n", "\\n")
-                yield "<script>setStatus('Fejl');</script>\n"
-                yield f"<script>addLog('{safe}');</script>\n"
-                yield "<p><a href='/import'>Tilbage</a></p>\n"
-                return
-            # --- end debug addition ---
+                if "ERROR" in line or "Traceback" in line:
+                    safe = line.replace("\\", "\\\\").replace("'", "\\'")
+                    yield f"<script>addLog('{safe}');</script>\n"
 
             yield "<script>setStatus('Opdaterer arkiv…');</script>\n"
             fts_cmd = [py, "scripts/update_left_fts_for_document.py", str(document_id)]
@@ -666,11 +865,8 @@ function addLog(t){
             yield "<p><a href='/'>Gå tilbage til oversigten</a></p>\n"
 
         except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            safe = tb.replace("\\", "\\\\").replace("'", "\\'").replace("\r", "").replace("\n", "\\n")
-            yield "<script>setStatus('Fejl');</script>\n"
-            yield f"<script>addLog('{safe}');</script>\n"
+            msg = str(e).replace("\\", "\\\\").replace("'", "\\'")
+            yield f"<script>setStatus('Fejl'); addLog('ERROR: {msg}');</script>\n"
             yield "<p><a href='/import'>Tilbage</a></p>\n"
 
         finally:
